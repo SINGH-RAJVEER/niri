@@ -238,3 +238,27 @@ This defaults to `/usr/bin/niri`.
 
 [Alacritty]: https://github.com/alacritty/alacritty
 [fuzzel]: https://codeberg.org/dnkl/fuzzel
+
+### Building this fork with Nix
+
+This fork exposes `packages.<system>.niri-fork`, alongside the existing `niri` and `default` outputs. Build it locally with `nix build .#niri-fork`; the executable is `./result/bin/niri`.
+
+To select this fork in a NixOS flake, add an input pointing to the checkout or the published fork revision:
+
+```nix
+inputs.niri-fork.url = "path:/home/rajveer/Projects/open-source/niri-fork";
+```
+
+Pass `inputs` through `specialArgs` and select the package in your NixOS module:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+	programs.niri = {
+		enable = true;
+		package = inputs.niri-fork.packages.${pkgs.stdenv.hostPlatform.system}.niri-fork;
+	};
+}
+```
+
+The default overlay also exposes `pkgs.niri-fork`. Installing this package does not replace an already running compositor; start a new session to use it. The DRM fixes still require live graphics-switching validation.
