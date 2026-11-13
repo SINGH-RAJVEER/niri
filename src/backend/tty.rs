@@ -589,6 +589,20 @@ impl Tty {
                 // new underlying device IDs.
                 self.ignored_nodes = self.compute_ignored_nodes();
 
+                // An ignore-drm-device entry may name a render node that appears after its
+                // primary node, so the primary node could have been opened before the entry
+                // resolved. Release any device that turned out to be ignored.
+                let newly_ignored = self
+                    .devices
+                    .keys()
+                    .filter(|node| self.ignored_nodes.contains(node))
+                    .copied()
+                    .collect::<Vec<_>>();
+                for node in newly_ignored {
+                    debug!("releasing device that is now ignored: {node}");
+                    self.device_removed(node.dev_id(), niri);
+                }
+
                 if let Err(err) = self.device_added(device_id, &path, niri) {
                     warn!("error adding device: {err:?}");
                 }
@@ -1153,20 +1167,20 @@ impl Tty {
     fn device_removed(&mut self, device_id: dev_t, niri: &mut Niri) {
         debug!("removing device: {device_id}");
 
-        let Ok(node) = DrmNode::from_dev_id(device_id) else {
-            warn!("error creating DrmNode");
+        // Look the node up among our devices rather than with DrmNode::from_dev_id(): by the
+        // time a removal arrives the device is usually gone from sysfs, and failing to find it
+        // would leave its fd open, keeping the driver busy.
+        let Some(node) = self
+            .devices
+            .keys()
+            .copied()
+            .find(|node| node.dev_id() == device_id)
+        else {
+            debug!("not one of our devices, skipping");
             return;
         };
 
-        if node.ty() != NodeType::Primary {
-            debug!("not a primary node, skipping");
-            return;
-        }
-
-        let Some(device) = self.devices.get_mut(&node) else {
-            warn!("unknown device");
-            return;
-        };
+        let device = self.devices.get_mut(&node).unwrap();
 
         let crtcs: Vec<_> = device
             .drm_scanner

@@ -142,6 +142,8 @@ debug {
 List DRM devices that niri will ignore.
 Useful for GPU passthrough when you don't want niri to open a certain device.
 
+Paths are resolved again when DRM devices appear. If a render-node path resolves after its primary node was opened, niri releases the ignored device on the later device event. Stable `/dev/dri/by-path/` paths support GPUs that disappear and reappear during graphics mode switching. Ignoring a GPU prevents niri from driving displays connected to it.
+
 ```kdl
 debug {
     ignore-drm-device "/dev/dri/renderD128"
