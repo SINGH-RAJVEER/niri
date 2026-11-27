@@ -1855,48 +1855,8 @@ impl Tty {
 
             niri.queue_redraw(&output);
         } else {
-            niri.send_frame_callbacks(&output);
-        }
-    }
-
-    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) {
-        let span = tracy_client::span!("Tty::on_estimated_vblank_timer");
-
-        let name = output.name();
-        span.emit_text(&name);
-
-        let Some(output_state) = niri.output_state.get_mut(&output) else {
-            error!("missing output state for {name}");
-            return;
-        };
-
-        // We waited for the timer, now we can send frame callbacks again.
-        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
-
-        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::WaitingForEstimatedVBlank(_) => (),
-            // The timer fired just in front of a redraw.
-            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
-                output_state.redraw_state = RedrawState::Queued;
-                return;
-            }
-            // Unexpected states, but let's not crash the compositor.
-            // https://github.com/niri-wm/niri/issues/4781
-            state @ (RedrawState::Idle
-            | RedrawState::Queued
-            | RedrawState::WaitingForVBlank { .. }) => {
-                error!(
-                    "unexpected redraw state for output {name} \
-                    (should be WaitingForEstimatedVBlank or WaitingForEstimatedVBlankAndQueued): \
-                    {state:?}"
-                );
-            }
-        }
-
-        if output_state.unfinished_animations_remain {
-            niri.queue_redraw(&output);
-        } else {
-            niri.send_frame_callbacks(&output);
+            let monitors_active = niri.monitors_active && self.is_active();
+            niri.send_frame_callbacks(&output, monitors_active);
         }
     }
 
@@ -1945,6 +1905,10 @@ impl Tty {
         };
 
         span.emit_text(&surface.name.connector);
+
+        // We'll put it back after successfully submitting a frame.
+        // Otherwise, we won't be expecting a VBlank.
+        let vblank_frame = surface.vblank_frame.take();
 
         if !device.drm.is_active() {
             // This branch hits any time we try to render while the user had switched to a
@@ -2061,10 +2025,21 @@ impl Tty {
                             output_state.frame_callback_sequence =
                                 output_state.frame_callback_sequence.wrapping_add(1);
 
+                            // Put the Tracy frame back since we are expecting a VBlank.
+                            surface.vblank_frame = vblank_frame;
+
                             return RenderResult::Submitted;
                         }
                         Err(err) => {
                             warn!("error queueing frame: {err}");
+
+                            // This error can happen when we're trying to lock the session while on
+                            // another TTY, switch to this TTY, then try to draw the first red
+                            // background frame, and it fails to queue. In this case, the
+                            // framebuffer is not cleared, and we must attempt to queue the frame
+                            // again. Reset the buffer ages, so that the damage tracker doesn't
+                            // prevent us from submitting the same red frame.
+                            drm_compositor.reset_buffer_ages();
                         }
                     }
                 } else {
@@ -2076,12 +2051,6 @@ impl Tty {
                 warn!("error rendering frame: {err}");
             }
         }
-
-        // We're not expecting a vblank right after this.
-        drop(surface.vblank_frame.take());
-
-        // Queue a timer to fire at the predicted vblank time.
-        queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
 
         rv
     }
@@ -2342,6 +2311,10 @@ impl Tty {
                 }
             }
         }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.session.is_active()
     }
 
     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
@@ -3150,52 +3123,6 @@ fn suspend() -> anyhow::Result<()> {
     .context("error suspending")?;
 
     Ok(())
-}
-
-fn queue_estimated_vblank_timer(
-    niri: &mut Niri,
-    output: Output,
-    target_presentation_time: Duration,
-) {
-    let output_state = niri.output_state.get_mut(&output).unwrap();
-    match mem::take(&mut output_state.redraw_state) {
-        RedrawState::Idle => unreachable!(),
-        RedrawState::Queued => (),
-        RedrawState::WaitingForVBlank { .. } => unreachable!(),
-        RedrawState::WaitingForEstimatedVBlank(token)
-        | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-            output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
-            return;
-        }
-    }
-
-    let now = get_monotonic_time();
-    let mut duration = target_presentation_time.saturating_sub(now);
-
-    // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
-    // render(). This can happen for example with unknown presentation time from DRM.
-    if duration.is_zero() {
-        duration += output_state
-            .frame_clock
-            .refresh_interval()
-            // Unknown refresh interval, i.e. winit backend. Would be good to estimate it somehow
-            // but it's not that important for this code path.
-            .unwrap_or(Duration::from_micros(16_667));
-    }
-
-    trace!("queueing estimated vblank timer to fire in {duration:?}");
-
-    let timer = Timer::from_duration(duration);
-    let token = niri
-        .event_loop
-        .insert_source(timer, move |_, _, data| {
-            data.backend
-                .tty()
-                .on_estimated_vblank_timer(&mut data.niri, output.clone());
-            TimeoutAction::Drop
-        })
-        .unwrap();
-    output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
 }
 
 pub fn calculate_drm_mode_from_modeline(modeline: &Modeline) -> anyhow::Result<DrmMode> {
